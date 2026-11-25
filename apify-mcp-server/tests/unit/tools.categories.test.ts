@@ -1,0 +1,97 @@
+import { describe, expect, it } from 'vitest';
+
+import { CATEGORY_NAMES, getCategoryTools, toolCategories } from '../../src/tools/index.js';
+import type { ToolCategory, ToolEntry } from '../../src/types.js';
+
+describe('CATEGORY_NAMES', () => {
+    it('matches the keys of toolCategories', () => {
+        const staticKeys = Object.keys(toolCategories);
+        expect([...CATEGORY_NAMES]).toEqual(staticKeys);
+    });
+});
+
+describe('getCategoryTools', () => {
+    it('returns all category keys matching CATEGORY_NAMES', () => {
+        const defaultResult = getCategoryTools('default');
+        const appsResult = getCategoryTools('apps');
+
+        for (const name of CATEGORY_NAMES) {
+            expect(defaultResult).toHaveProperty(name);
+            expect(appsResult).toHaveProperty(name);
+        }
+    });
+
+    it('returns no undefined entries in any category (circular-init safety)', () => {
+        const defaultResult = getCategoryTools('default');
+        const appsResult = getCategoryTools('apps');
+
+        for (const name of CATEGORY_NAMES) {
+            for (const tool of defaultResult[name]) {
+                expect(tool).toBeDefined();
+                expect(tool.name).toBeDefined();
+            }
+            for (const tool of appsResult[name]) {
+                expect(tool).toBeDefined();
+                expect(tool.name).toBeDefined();
+            }
+        }
+    });
+
+    it('shares the same call-actor tool across modes (mode-independent object; widget addendum is session-gated)', () => {
+        const defaultResult = getCategoryTools('default');
+        const appsResult = getCategoryTools('apps');
+
+        const defaultCallActor = defaultResult.actors.find((t: ToolEntry) => t.name === 'call-actor');
+        const appsCallActor = appsResult.actors.find((t: ToolEntry) => t.name === 'call-actor');
+        expect(defaultCallActor).toBeDefined();
+        expect(appsCallActor).toBeDefined();
+        expect(defaultCallActor).toBe(appsCallActor);
+    });
+
+    it('shares the same get-actor-run tool across modes (mode-independent)', () => {
+        const defaultResult = getCategoryTools('default');
+        const appsResult = getCategoryTools('apps');
+
+        const defaultGetRun = defaultResult.runs.find((t: ToolEntry) => t.name === 'get-actor-run');
+        const appsGetRun = appsResult.runs.find((t: ToolEntry) => t.name === 'get-actor-run');
+
+        expect(defaultGetRun).toBeDefined();
+        expect(appsGetRun).toBeDefined();
+        // Same object — data-only, mode-independent. UI rendering lives in get-actor-run-widget.
+        expect(defaultGetRun).toBe(appsGetRun);
+    });
+
+    it('shares identical tools for mode-independent categories', () => {
+        const defaultResult = getCategoryTools('default');
+        const appsResult = getCategoryTools('apps');
+
+        const modeIndependentCategories: ToolCategory[] = [
+            'docs',
+            'storage',
+            'tasks',
+            'schedules',
+            'builds',
+            'versions',
+            'api',
+            'dev',
+        ];
+        for (const cat of modeIndependentCategories) {
+            expect(defaultResult[cat]).toEqual(appsResult[cat]);
+        }
+    });
+
+    it('preserves tool ordering within categories', () => {
+        const result = getCategoryTools('default');
+        const actorNames = result.actors.map((t: ToolEntry) => t.name);
+
+        // Verify workflow order: search → details → call → MCP tool list → MCP tool call → server request
+        expect(actorNames).toEqual([
+            'search-actors',
+            'fetch-actor-details',
+            'call-actor',
+            'fetch-actor-mcp-tool-list',
+            'call-actor-mcp-tool',
+            'send-server-actor-request',
+        ]);
+    });
+});

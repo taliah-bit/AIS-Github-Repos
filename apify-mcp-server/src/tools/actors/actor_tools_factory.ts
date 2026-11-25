@@ -1,0 +1,534 @@
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
+
+import log from '@apify/log';
+
+import type { ApifyClient } from '../../apify_client.js';
+import {
+    ACTOR_MAX_MEMORY_MBYTES,
+    FAILURE_CATEGORY,
+    HELPER_TOOLS,
+    MAX_INLINE_BYTES,
+    OFFICIAL_ACTORS_WITH_SIDE_EFFECTS,
+    OFFICIAL_APIFY_USERNAMES,
+} from '../../const.js';
+import { ActorLoadError } from '../../errors.js';
+import { getActorMCPServerPath, getActorMCPServerURL } from '../../mcp/actors.js';
+import { connectMCPClient } from '../../mcp/client.js';
+import { getMCPServerTools } from '../../mcp/proxy.js';
+import type { PaymentProvider } from '../../payments/types.js';
+import {
+    type ActorDefinitionWithInfo,
+    type ActorInfo,
+    type ActorStore,
+    type ActorTool,
+    type ToolDescriptionContext,
+    type ToolEntry,
+    type ToolInputSchema,
+    ACTOR_TOOL_MODE,
+    ALL_TOOLS_PRESENT,
+    TOOL_TYPE,
+} from '../../types.js';
+import { getActorDefinitionCached } from '../../utils/actor.js';
+import { stripQuoteWrappers } from '../../utils/generic.js';
+import { logHttpError } from '../../utils/logging.js';
+import { buildActorInputSchema, compileUntrustedSchema } from '../actor_input_schema.js';
+import {
+    actorNameToToolName,
+    getActorToolModeFromInterfaces,
+    isActorBlockedUnderPaymentProvider,
+    resolveActorInterfaces,
+    resolveActorTenancy,
+    resolveActorToolMode,
+} from '../actor_tool_naming.js';
+import {
+    buildEnrichedDirectActorOutputSchema,
+    actorRunOutputSchema,
+    serverActorRequestOutputSchema,
+} from '../structured_output_schemas.js';
+import { CALL_ACTOR_WAIT_SECS_DEFAULT, WAIT_SECS_MAX } from './actor_run_response.js';
+import { buildDirectActorContract, getActorToolPolicy } from './actor_tool_contract.js';
+import {
+    buildServerActorToolSchemas,
+    executeSendServerActorRequest,
+    redactServerActorRequestArgs,
+} from './send_server_actor_request.js';
+import { buildServerActorToolDescription, formatTenancyBilling } from './server_interface_details.js';
+
+/**
+ * MCP-only opt-in injected next to the Actor's own input fields. Same contract as `call-actor`'s
+ * `waitSecs`: default 30, max 45. If the Actor's own input schema happens to declare `waitSecs`,
+ * this property overrides it — the field is reserved for the MCP server's wait control.
+ */
+const WAIT_SECS_INPUT_PROPERTY = {
+    type: 'integer',
+    minimum: 0,
+    maximum: WAIT_SECS_MAX,
+    default: CALL_ACTOR_WAIT_SECS_DEFAULT,
+    description:
+        `Max seconds (0–45, default ${CALL_ACTOR_WAIT_SECS_DEFAULT}) to cap the wait for the Actor run to reach terminal state. ` +
+        'For long-running Actors the response returns at the cap with the current run status; ' +
+        `follow \`nextStep\` to poll via ${HELPER_TOOLS.ACTOR_RUNS_GET}. Set to 0 to fire-and-forget.`,
+} as const;
+
+/**
+ * For each direct actor tool with a known historical item schema, replaces the generic
+ * `actorRunOutputSchema` with a per-tool variant that declares
+ * `storages.datasets.default.itemsSchema` — letting an LLM plan field projection from
+ * `tools/list` alone, before any call.
+ *
+ * Uses `Promise.allSettled` so a single store failure doesn't block other tools. Individual
+ * misses (null / empty properties / thrown errors) leave the tool on the generic schema.
+ */
+export async function enrichActorToolOutputSchemas(tools: ToolEntry[], actorStore: ActorStore): Promise<void> {
+    const enrichPromises = tools
+        .filter((tool): tool is ActorTool => tool.type === TOOL_TYPE.ACTOR)
+        .map(async (tool) => {
+            try {
+                const itemProperties = await actorStore.getActorOutputSchema(tool.actorFullName);
+                if (itemProperties && Object.keys(itemProperties).length > 0) {
+                    // eslint-disable-next-line no-param-reassign
+                    tool.outputSchema = buildEnrichedDirectActorOutputSchema(itemProperties);
+                    // Stash the raw properties so the executor can mirror them into
+                    // `structuredContent.storages.datasets.default.itemsSchema` at runtime.
+                    // eslint-disable-next-line no-param-reassign
+                    tool.datasetItemsSchema = itemProperties;
+                }
+            } catch (error) {
+                log.debug('Failed to enrich output schema for Actor', {
+                    actorName: tool.actorFullName,
+                    errMessage: error instanceof Error ? error.message : String(error),
+                });
+            }
+        });
+
+    await Promise.allSettled(enrichPromises);
+}
+
+/**
+ * Clients such as Claude run read-only tools without asking each time (see apify/apify-mcp-server#973).
+ * An Actor counts as read-only only when Apify maintains it and nothing lets it act outside its run
+ * storages: limited permissions keep it out of the user's other Apify data, and it has no secret input
+ * (credentials for other services), writable storage input (writes to the user's existing storages),
+ * MCP connector input (writes to connected apps) or code input.
+ */
+function isReadOnlyActor({ actor, definition }: ActorInfo): boolean {
+    if (!OFFICIAL_APIFY_USERNAMES.has(actor.username)) return false;
+    if (OFFICIAL_ACTORS_WITH_SIDE_EFFECTS.has(definition.actorFullName)) return false;
+    if (actor.actorPermissionLevel !== 'LIMITED_PERMISSIONS') return false;
+
+    const inputProperties = Object.values(definition.input?.properties ?? {});
+    return !inputProperties.some(
+        (property) =>
+            property.isSecret ||
+            (['dataset', 'keyValueStore', 'requestQueue'].includes(property.resourceType ?? '') &&
+                property.resourcePermissions?.includes('WRITE')) ||
+            property.resourceType === 'mcpConnector' ||
+            property.editor === 'javascript' ||
+            property.editor === 'python',
+    );
+}
+
+/**
+ * Fetches input schemas for normal (non-MCP-server) Actors by ID or full name and compiles them
+ * into MCP tools, using AJV to validate the input schemas. Tool name can't contain /, so it is
+ * replaced with _.
+ *
+ * The input schema processing workflow:
+ * 1. Properties are marked as required using markInputPropertiesAsRequired() to add "REQUIRED" prefix to descriptions
+ * 2. Nested properties are built by analyzing editor type (proxy, requestListSources) using buildNestedProperties()
+ * 3. Properties are filtered using filterSchemaProperties()
+ * 4. Properties are shortened using shortenProperties()
+ * 5. Prefill/default values are added to descriptions as examples using addExampleValuesToDescriptions()
+ *
+ * @param {ActorInfo[]} actorsInfo - An array of ActorInfo objects with webServerMcpPath, definition, and Actor.
+ * @param options - Optional settings: mcpSessionId for telemetry correlation, actorStore for per-Actor itemsSchema enrichment.
+ * @returns {Promise<ToolEntry[]>} - A promise that resolves to an array of MCP tools.
+ */
+export async function getNormalActorsAsTools(
+    actorsInfo: ActorInfo[],
+    options?: { mcpSessionId?: string; actorStore?: ActorStore; isDirectTool?: boolean },
+): Promise<ToolEntry[]> {
+    const { mcpSessionId, actorStore, isDirectTool = true } = options ?? {};
+    const tools: ToolEntry[] = [];
+
+    for (const actorInfo of actorsInfo) {
+        const { definition } = actorInfo;
+
+        if (!definition) continue;
+
+        const { actorFullName, description: actorDescription } = definition;
+        const contract = isDirectTool
+            ? buildDirectActorContract(actorFullName, definition.input)
+            : { input: definition.input, description: '' };
+        const isReadOnly = isReadOnlyActor({ ...actorInfo, definition: { ...definition, input: contract.input } });
+        const { inputSchema } = buildActorInputSchema(definition.actorFullName, contract.input);
+
+        // Inject the MCP-only `waitSecs` opt-in before AJV compile so the LLM can cap the wait.
+        const inputSchemaWithWaitSecs = inputSchema as { properties?: Record<string, unknown> };
+        inputSchemaWithWaitSecs.properties = {
+            ...(inputSchemaWithWaitSecs.properties ?? {}),
+            waitSecs: WAIT_SECS_INPUT_PROPERTY,
+        };
+
+        // The closure below must capture only the note, not `contract`: that would keep the
+        // per-call copy of the input schema alive for the session's lifetime.
+        const contractDescription = contract.description;
+        // Names call-actor only when the session actually has it.
+        const buildDescription = (context: ToolDescriptionContext): string => {
+            const { hasTool } = context;
+            let description = `This tool calls the Actor "${actorFullName}" and retrieves its output results.
+${hasTool(HELPER_TOOLS.ACTOR_CALL) ? `Use this tool instead of the "${HELPER_TOOLS.ACTOR_CALL}" if user requests this specific Actor.\n` : ''}Actor description: ${actorDescription}`;
+            const policyDescription = getActorToolPolicy(actorFullName)?.buildDescription?.(context);
+            if (policyDescription) description += `\n\n${policyDescription}`;
+            if (contractDescription) description += `\n\n${contractDescription}`;
+            return description;
+        };
+
+        const memoryMbytes = Math.min(
+            definition.defaultRunOptions?.memoryMbytes || ACTOR_MAX_MEMORY_MBYTES,
+            ACTOR_MAX_MEMORY_MBYTES,
+        );
+
+        let compiled;
+        try {
+            // Unknown properties are silently stripped by AJV's removeAdditional option.
+            // Dynamic Actor input fields are part of the Actor's own inputSchema, so they
+            // are declared properties and won't be stripped.
+            compiled = compileUntrustedSchema(inputSchema as ToolInputSchema);
+        } catch (e) {
+            // SchemaTooLargeError logs as a soft fail; a genuine AJV compile error stays an error.
+            logHttpError(e, 'Failed to compile schema', {
+                actorName: definition.actorFullName,
+                mcpSessionId,
+            });
+            continue;
+        }
+
+        tools.push({
+            type: TOOL_TYPE.ACTOR,
+            name: actorNameToToolName(definition.actorFullName),
+            title: definition.actorFullName,
+            actorId: definition.id,
+            actorFullName: definition.actorFullName,
+            description: buildDescription(ALL_TOOLS_PRESENT),
+            buildDescription,
+            // The compile cache returns one schema object per content, so sessions share one copy.
+            inputSchema: compiled.schema,
+            // Canonical RunResponse shape — same as call-actor and get-actor-run.
+            outputSchema: actorRunOutputSchema,
+            ajvValidate: compiled.validate,
+            paymentRequired: true,
+            memoryMbytes,
+            icons: definition.pictureUrl ? [{ src: definition.pictureUrl, mimeType: 'image/png' }] : undefined,
+            annotations: {
+                title: definition.actorFullName,
+                readOnlyHint: isReadOnly,
+                destructiveHint: !isReadOnly,
+                openWorldHint: true,
+            },
+            // Allow long-running tasks for Actor tools, make it optional for now
+            execution: {
+                taskSupport: 'optional',
+            },
+        });
+    }
+
+    if (actorStore) {
+        await enrichActorToolOutputSchemas(tools, actorStore);
+    }
+
+    return tools;
+}
+
+/**
+ * Builds the own tool of each Actor served through its server interface: `send-server-actor-request` with the Actor
+ * fixed, its documented operations in the description and its methods and paths in the input schema.
+ * `readOnlyHint` is the Actor's, as for a run tool.
+ */
+export function getServerActorsAsTools(actorsInfo: ActorInfo[]): ToolEntry[] {
+    const tools: ToolEntry[] = [];
+    for (const actorInfo of actorsInfo) {
+        const { definition, actor } = actorInfo;
+        const toolInfo = definition.webServerToolInfo;
+        // `getActorsAsTools` reports an Actor without it.
+        if (!toolInfo) continue;
+        const { actorFullName, description } = definition;
+        const isReadOnly = isReadOnlyActor(actorInfo);
+        const costNotice = formatTenancyBilling({
+            tenancy: resolveActorTenancy(actor),
+            idleTimeoutSecs: actor.actorStandby?.idleTimeoutSecs,
+        });
+        // Names fetch-actor-details only when the session has it, and only when the operations are not in full.
+        const buildDescription = ({ hasTool }: ToolDescriptionContext): string => {
+            const head = `This tool sends one HTTP request to the server interface of the Actor "${actorFullName}" and returns the response.
+${hasTool(HELPER_TOOLS.ACTOR_SERVER_REQUEST) ? `Use this tool instead of the "${HELPER_TOOLS.ACTOR_SERVER_REQUEST}" if user requests this specific Actor.\n` : ''}Actor description: ${description}
+${costNotice}
+The request is sent once, with no retries and without following redirects. A JSON, text, or XML response body is returned as text; other content types, and bodies over ${MAX_INLINE_BYTES} bytes, are not returned.
+
+Operations:
+`;
+            return buildServerActorToolDescription(head, toolInfo, hasTool(HELPER_TOOLS.ACTOR_GET_DETAILS));
+        };
+        tools.push({
+            type: TOOL_TYPE.ACTOR_SERVER,
+            name: actorNameToToolName(actorFullName),
+            title: actorFullName,
+            actorId: definition.id,
+            actorFullName,
+            description: buildDescription(ALL_TOOLS_PRESENT),
+            buildDescription,
+            ...buildServerActorToolSchemas(toolInfo),
+            outputSchema: serverActorRequestOutputSchema,
+            icons: definition.pictureUrl ? [{ src: definition.pictureUrl, mimeType: 'image/png' }] : undefined,
+            annotations: {
+                title: actorFullName,
+                readOnlyHint: isReadOnly,
+                destructiveHint: !isReadOnly,
+                openWorldHint: true,
+            },
+            redactArgs: redactServerActorRequestArgs,
+            // Composition drops the tool in a payment-provider session, but a tool upserted before composition
+            // (auto mode before initialize, `processParamsGetTools`) is still rejected here before any request.
+            hasPaymentProviderStandbyCheck: true,
+            call: async (toolArgs) =>
+                executeSendServerActorRequest({ ...toolArgs, args: { ...toolArgs.args, actor: actorFullName } }),
+        });
+    }
+    return tools;
+}
+
+export async function getMCPServersAsTools(
+    actorsInfo: ActorInfo[],
+    apifyClient: Pick<ApifyClient, 'token' | 'requestOrigin'>,
+    mcpSessionId?: string,
+): Promise<ToolEntry[]> {
+    const { token, requestOrigin } = apifyClient;
+    // Payment-provider request with no Apify token: standby Actors aren't supported here, so
+    // MCP servers — which are always standby Actors — are skipped since they'd fail anyway.
+    if (token === null || token === undefined) {
+        return [];
+    }
+
+    // Process all actors in parallel
+    const actorToolPromises = actorsInfo.map(async (actorInfo) => {
+        const actorId = actorInfo.definition.id;
+        if (!actorInfo.webServerMcpPath) {
+            log.warning('Actor does not have a web server MCP path, skipping', {
+                actorFullName: actorInfo.definition.actorFullName,
+                actorId,
+                mcpSessionId,
+            });
+            return [];
+        }
+
+        let client: Client | null = null;
+        try {
+            // getActorMCPServerURL rejects a webServerMcpPath that escapes the Actor's standby origin.
+            // Resolve it inside the try so one Actor's bad path skips only that Actor, not the whole batch.
+            const mcpServerUrl = await getActorMCPServerURL(actorInfo.actor, actorInfo.webServerMcpPath);
+            log.debug('Retrieved MCP server URL for Actor', {
+                actorFullName: actorInfo.definition.actorFullName,
+                actorId,
+                mcpServerUrl,
+                mcpSessionId,
+            });
+
+            client = await connectMCPClient(mcpServerUrl, { token, requestOrigin }, mcpSessionId);
+            if (!client) {
+                // Skip this Actor, connectMCPClient will log the error
+                return [];
+            }
+            return await getMCPServerTools(actorId, client, mcpServerUrl, actorInfo.definition.actorFullName);
+        } catch (error) {
+            logHttpError(error, 'Failed to load tools from MCP server', {
+                actorFullName: actorInfo.definition.actorFullName,
+                actorId,
+                mcpSessionId,
+            });
+            return [];
+        } finally {
+            if (client) await client.close();
+        }
+    });
+
+    // Wait for all actors to be processed in parallel
+    const actorToolsArrays = await Promise.all(actorToolPromises);
+    return actorToolsArrays.flat();
+}
+
+/**
+ * Fixes an Actor name input from LLM and logs at INFO when the input differed from the fixed version.
+ * Single entry point for fix+log — avoids duplicating the pattern at every call site.
+ */
+export function fixActorNameInputAndLog(actorName: string, extra?: Record<string, unknown>): string {
+    const fixed = fixActorNameInput(actorName);
+    if (fixed !== actorName) {
+        log.info(
+            'Actor name input required normalization before lookup (quotes, spacing, slash padding, or a tool name)',
+            {
+                actorNameInput: actorName,
+                actorNameFixed: fixed,
+                ...extra,
+            },
+        );
+    }
+    return fixed;
+}
+
+export const EMPTY_ACTOR_NAME_MESSAGE =
+    '"actor" must not be empty. Give the Actor ID or its name in the "username/name" form.';
+
+/** The `:toolName` of the removed `actorName:toolName` form; a URL's `scheme://` is not one. */
+export const MCP_TOOL_NAME_SUFFIX = /:[^/]*$/;
+
+/**
+ * Fixes Actor name strings (`username/name`) before cache + Apify API lookup.
+ *
+ * LLMs often wrap values in markdown quotes or smart quotes and insert spaces around `/`.
+ * The Apify API treats those as distinct strings → avoidable 404 SOFT_FAIL. This only trims
+ * and strips common wrappers / spacing noise; valid names pass through unchanged.
+ * It also drops the `:toolName` of the removed `actorName:toolName` form, since a name never contains a colon.
+ */
+export function fixActorNameInput(actorName: string): string {
+    const s = stripQuoteWrappers(actorName).replace(/\s*\/\s*/g, '/');
+    return s.replace(/\s+/g, ' ').trim().replace(MCP_TOOL_NAME_SUFFIX, '');
+}
+
+/**
+ * Result type for {@link getActorsAsTools}: every requested name produces
+ * either a successful load (contributing to `tools` — a single Actor can fan
+ * out into multiple tools for MCP-server Actors) or an `ActorLoadError`
+ * describing why the load failed.
+ *
+ * Bulk callers (`getActors`, server load-helpers) typically only read
+ * `tools`. The single-Actor caller (`call-actor`) reads `errors[0]` to surface
+ * the precise reason back to the agent.
+ */
+export type ActorsAsToolsResult = {
+    tools: ToolEntry[];
+    errors: ActorLoadError[];
+};
+
+/**
+ * Loads Actor metadata + builds MCP tool entries for the requested Actor
+ * names. Returns both successful tools and `ActorLoadError` entries so
+ * callers can surface precise reasons when needed (a single-Actor flow like
+ * `call-actor`) or just ignore failures (bulk session-boot flows that build
+ * the initial tool surface).
+ *
+ * When `paymentProvider` is set, standby and MCP-server Actors are reported
+ * as `STANDBY_PAYMENT_NOT_SUPPORTED` errors instead of contributing tools.
+ * External payment providers (x402, Skyfire) cannot pay for standby Actor
+ * runs — the call-time guard in `call_actor.ts` rejects any such
+ * tool call. Filtering at list time keeps the advertised tool surface
+ * honest so agents never discover a tool that can only fail later.
+ */
+export async function getActorsAsTools(
+    actorIdsOrNames: string[],
+    apifyClient: ApifyClient,
+    options?: {
+        mcpSessionId?: string;
+        actorStore?: ActorStore;
+        paymentProvider?: PaymentProvider;
+        isDirectTool?: boolean;
+    },
+): Promise<ActorsAsToolsResult> {
+    const { mcpSessionId, actorStore, paymentProvider, isDirectTool = true } = options ?? {};
+    log.debug('Fetching Actors as tools', {
+        actorNames: actorIdsOrNames,
+        mcpSessionId,
+        paymentProviderId: paymentProvider?.id,
+    });
+
+    const errors: ActorLoadError[] = [];
+
+    const actorsInfo: (ActorInfo | null)[] = await Promise.all(
+        actorIdsOrNames.map(async (actorIdOrName) => {
+            const actorName = fixActorNameInputAndLog(actorIdOrName, { mcpSessionId });
+
+            let actorDefinitionWithInfo: ActorDefinitionWithInfo | null;
+            try {
+                actorDefinitionWithInfo = await getActorDefinitionCached(actorName, apifyClient);
+            } catch (error) {
+                logHttpError(error, 'Failed to fetch Actor definition', {
+                    actorName,
+                    ...(actorName !== actorIdOrName && { actorNameInput: actorIdOrName }),
+                    mcpSessionId,
+                });
+                errors.push(ActorLoadError.loadFailed(actorIdOrName));
+                return null;
+            }
+
+            if (!actorDefinitionWithInfo) {
+                log.softFail('Actor not found or definition is not available', {
+                    actorName,
+                    ...(actorName !== actorIdOrName && { actorNameInput: actorIdOrName }),
+                    mcpSessionId,
+                    statusCode: 404,
+                    failureCategory: 'INVALID_INPUT',
+                });
+                errors.push(ActorLoadError.notFound(actorIdOrName));
+                return null;
+            }
+
+            return {
+                definition: actorDefinitionWithInfo.definition,
+                actor: actorDefinitionWithInfo.info,
+                webServerMcpPath: getActorMCPServerPath(actorDefinitionWithInfo.definition),
+            } as ActorInfo;
+        }),
+    );
+
+    const clonedActors = structuredClone(actorsInfo);
+    const nonNullActors = clonedActors.filter((actorInfo): actorInfo is ActorInfo => Boolean(actorInfo));
+
+    // Split server-interface vs MCP-server vs normal Actors. Under `paymentProvider`, standby/MCP-server
+    // Actors are reported as STANDBY_PAYMENT_NOT_SUPPORTED errors instead of contributing
+    // tools — the platform API hard-rejects standby runs under third-party providers.
+    const serverActorsInfo: ActorInfo[] = [];
+    const actorMCPServersInfo: ActorInfo[] = [];
+    const normalActorsInfo: ActorInfo[] = [];
+    for (const actorInfo of nonNullActors) {
+        if (paymentProvider && isActorBlockedUnderPaymentProvider(actorInfo.actor)) {
+            errors.push(ActorLoadError.standbyPaymentNotSupported(actorInfo.definition.actorFullName));
+            continue;
+        }
+
+        // `call-actor` starts runs, so only an Actor's own tool takes the server interface.
+        const toolMode = isDirectTool
+            ? resolveActorToolMode(actorInfo)
+            : getActorToolModeFromInterfaces(resolveActorInterfaces(actorInfo));
+        if (toolMode === ACTOR_TOOL_MODE.SERVER_ACTOR_WITHOUT_MCP) {
+            const error = ActorLoadError.serverActorWithoutMcpNotSupported(actorInfo.definition.actorFullName);
+            log.softFail('Skipping server Actor with no MCP server and an empty input schema', {
+                actorName: actorInfo.definition.actorFullName,
+                mcpSessionId,
+                actorLoadErrorKind: error.kind,
+                failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+            });
+            errors.push(error);
+            continue;
+        }
+        if (toolMode === ACTOR_TOOL_MODE.SERVER && !actorInfo.definition.webServerToolInfo) {
+            // A definition built before `webServerToolInfo` existed has a server interface and no tool to serve.
+            const error = ActorLoadError.loadFailed(actorInfo.definition.actorFullName);
+            log.warning('Skipping Server Actor whose definition has no tool info', {
+                actorName: actorInfo.definition.actorFullName,
+                mcpSessionId,
+                actorLoadErrorKind: error.kind,
+            });
+            errors.push(error);
+            continue;
+        }
+        if (toolMode === ACTOR_TOOL_MODE.SERVER) serverActorsInfo.push(actorInfo);
+        else if (toolMode === ACTOR_TOOL_MODE.MCP) actorMCPServersInfo.push(actorInfo);
+        else normalActorsInfo.push(actorInfo);
+    }
+
+    const [normalTools, mcpServerTools] = await Promise.all([
+        getNormalActorsAsTools(normalActorsInfo, { mcpSessionId, actorStore, isDirectTool }),
+        getMCPServersAsTools(actorMCPServersInfo, apifyClient, mcpSessionId),
+    ]);
+
+    return { tools: [...normalTools, ...getServerActorsAsTools(serverActorsInfo), ...mcpServerTools], errors };
+}
